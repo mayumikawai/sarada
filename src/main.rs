@@ -13,7 +13,7 @@ const IP_RESOLVER: &str = "speed.cloudflare.com";
 const PATH_RESOLVER: &str = "/meta";
 const PROXY_FILE: &str = "data/rawProxyList.txt";
 const OUTPUT_FILE: &str = "data/alive.txt";
-const MAX_CONCURRENT: usize = 20;
+const MAX_CONCURRENT: usize = 50;
 const TIMEOUT_SECONDS: u64 = 5;
 
 // Define a custom error type that implements Send + Sync
