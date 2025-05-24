@@ -1,7 +1,7 @@
 name: CF Proxy Scan
 
 on:
-  workflow_dispatch: # Memungkinkan Anda menjalankan workflow ini secara manual dari GitHub UI
+  workflow_dispatch: # Memungkinkan dijalankan secara manual
 
 jobs:
   update-proxies:
@@ -10,25 +10,21 @@ jobs:
 
     steps:
     - name: 📂 Checkout Repository
-      uses: actions/checkout@v4 # Gunakan versi terbaru dari checkout action
+      uses: actions/checkout@v4
       with:
-        # Tidak perlu token khusus jika Anda hanya melakukan checkout dan push ke repo yang sama
-        # default GITHUB_TOKEN punya izin cukup. Hapus 'token' ini jika tidak diperlukan.
-        # token: ${{ secrets.GIT_TOKEN }}
-        fetch-depth: 0 # Penting untuk git commit/push agar ada riwayat lengkap
+        fetch-depth: 0
+        token: ${{ secrets.GIT_TOKEN }}
 
     - name: 🛠️ Install Rust Toolchain
-      uses: dtolnay/rust-toolchain@stable # Ini akan menginstal Rust di runner
+      uses: dtolnay/rust-toolchain@stable
 
     - name: 📦 Build Rust Project (Release)
-      run: cargo build --release # Ini akan mengkompilasi kode Anda
+      run: cargo build --release
 
     - name: 🧪 Give Execute Permission to Binary
-      # Binary akan berada di target/release/proxy_checker (sesuaikan nama binary jika berbeda)
       run: chmod +x ./target/release/proxy_checker
 
     - name: 🚀 Run Rust Binary
-      # Jalankan binary yang baru dikompilasi
       run: ./target/release/proxy_checker
 
     - name: 📤 Commit and Push Changes
@@ -36,11 +32,10 @@ jobs:
       run: |
         git config --global user.name "Github Actions"
         git config --global user.email "actions@github.com"
-        
-        # Tambahkan hanya file alive.txt
+        git remote set-url origin https://x-access-token:${{ secrets.GIT_TOKEN }}@github.com/${{ github.repository }}.git
+
         git add data/alive.txt
 
-        # Cek apakah ada perubahan pada file tersebut
         if ! git diff --staged --quiet; then
           echo "Perubahan pada data/alive.txt terdeteksi. Melakukan commit..."
           git commit -m "🔁 Update alive.txt by CF Proxy Scan"
@@ -55,4 +50,4 @@ jobs:
       with:
         name: alive-proxies
         path: data/alive.txt
-        if-no-files-found: ignore # Jangan menyebabkan workflow gagal jika alive.txt tidak ada
+        if-no-files-found: ignore
