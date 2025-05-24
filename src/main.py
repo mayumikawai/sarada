@@ -11,8 +11,8 @@ import re
 
 IP_RESOLVER = "speed.cloudflare.com"
 PATH_RESOLVER = "/meta"
-PROXY_FILE = "Data/ProxyIsp.txt"
-OUTPUT_FILE = "Data/alive.txt"
+PROXY_FILE = "data/ISPproxy.txt"
+OUTPUT_FILE = "data/alive.txt"
 MAX_CONCURRENT_CHECKS = 100  # Jumlah pemeriksaan proxy konkuren, sesuaikan sesuai kebutuhan
 REQUEST_TIMEOUT = 10  # Waktu timeout untuk setiap permintaan dalam detik
 
