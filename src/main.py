@@ -93,7 +93,7 @@ async def process_proxy(session, proxy_line, semaphore):
             # --- PERUBAHAN DI SINI ---
             # Mengasumsikan proxy adalah HTTPS proxy.
             # Jika proxy Anda adalah HTTP proxy standar, gunakan "http://"
-            proxy_url_for_aiohttp = f"https://{ip}:{port_num}"
+            proxy_url_for_aiohttp = f"http://{ip}:{port_num}"
             # -------------------------
 
             ori_data = await check_ip_via_proxy(session, target_url)
