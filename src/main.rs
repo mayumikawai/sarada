@@ -1,184 +1,264 @@
-
-use tokio::fs::File;
-use tokio::io::{self, AsyncBufReadExt, BufReader};
-use reqwest::{Client, Proxy, Error};
-use serde::{Deserialize, Serialize};
-use rayon::prelude::*;
-// use std::collections::HashMap; // BARIS INI DIHAPUS
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use regex::Regex;
-use futures::future::join_all;
 
-const CLOUDFLARE_META_URL: &str = "https://speed.cloudflare.com/meta";
-const PROXY_TIMEOUT_SECONDS: u64 = 10; // Timeout untuk setiap permintaan proxy
+use futures::StreamExt;
+use native_tls::TlsConnector;
+use serde_json::Value;
 
-#[derive(Debug, Deserialize, Serialize)]
-struct CloudflareMeta {
-    ip: String,
-    country: Option<String>,
-    #[serde(rename = "asOrganization")]
-    as_organization: Option<String>,
-}
+const IP_RESOLVER: &str = "speed.cloudflare.com";
+const PATH_RESOLVER: &str = "/meta";
+const PROXY_FILE: &str = "data/rawProxyList.txt";
+const OUTPUT_FILE: &str = "data/alive.txt";
+const MAX_CONCURRENT: usize = 20;
+const TIMEOUT_SECONDS: u64 = 5;
 
-/// Membersihkan string dari karakter non-alfanumerik atau non-spasi.
-fn clean_string(s: &str) -> String {
-    let re = Regex::new(r"[^a-zA-Z0-9\s.,\-_()]").unwrap();
-    re.replace_all(s, "").trim().to_string()
-}
-
-/// Mengambil metadata Cloudflare (termasuk IP) baik tanpa proxy maupun dengan proxy.
-async fn get_cloudflare_meta(client: &Client) -> Result<CloudflareMeta, Error> {
-    let response = client.get(CLOUDFLARE_META_URL)
-        .timeout(Duration::from_secs(PROXY_TIMEOUT_SECONDS))
-        .send()
-        .await?
-        .json::<CloudflareMeta>()
-        .await?;
-    Ok(response)
-}
-
-/// Memproses satu proxy: mendapatkan IP asli, mencoba IP melalui proxy, dan membandingkan.
-async fn process_proxy(
-    proxy_addr: String,
-    original_ip: Arc<String>,
-    alive_proxies: Arc<Mutex<Vec<String>>>,
-) {
-    println!("Mengecek proxy: {}", proxy_addr);
-
-    let client_builder = Client::builder()
-        .timeout(Duration::from_secs(PROXY_TIMEOUT_SECONDS))
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-
-    let proxy_obj = match Proxy::all(&proxy_addr) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Error membuat objek proxy {}: {}", proxy_addr, e);
-            return;
-        }
-    };
-
-    let client_with_proxy = match client_builder.proxy(proxy_obj).build() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Error membuat client dengan proxy {}: {}", proxy_addr, e);
-            return;
-        }
-    };
-
-    match get_cloudflare_meta(&client_with_proxy).await {
-        Ok(meta_with_proxy) => {
-            if meta_with_proxy.ip != *original_ip {
-                // Gunakan .clone() pada Option sebelum unwrap_or_else()
-                let country = meta_with_proxy.country.clone().unwrap_or_else(|| "N/A".to_string());
-                let org = meta_with_proxy.as_organization.clone().unwrap_or_else(|| "N/A".to_string());
-
-                let cleaned_country = clean_string(&country);
-                let cleaned_org = clean_string(&org);
-
-                let alive_entry = format!(
-                    "Proxy Aktif: {} | IP: {} | Negara: {} | Organisasi: {}",
-                    proxy_addr, meta_with_proxy.ip, cleaned_country, cleaned_org
-                );
-                println!("DITEMUKAN: {}", alive_entry);
-                alive_proxies.lock().unwrap().push(alive_entry);
-            } else {
-                println!("Proxy mati (IP tidak berubah): {}", proxy_addr);
-            }
-        }
-        Err(e) => {
-            eprintln!("Gagal mengakses Cloudflare melalui proxy {}: {}", proxy_addr, e);
-        }
-    }
-}
+// Define a custom error type that implements Send + Sync
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[tokio::main]
-async fn main() -> io::Result<()> {
-    println!("Memulai pemeriksaan proxy...");
-
-    // 1. Dapatkan IP asli perangkat
-    let client_without_proxy = Client::builder()
-        .timeout(Duration::from_secs(PROXY_TIMEOUT_SECONDS))
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        .build()
-        .expect("Gagal membangun client tanpa proxy");
-
-    println!("Mendapatkan IP asli perangkat...");
-    let original_meta = match get_cloudflare_meta(&client_without_proxy).await {
-        Ok(meta) => {
-            // Gunakan .clone() pada Option sebelum unwrap_or_else()
-            let country = meta.country.clone().unwrap_or_else(|| "N/A".to_string());
-            let org = meta.as_organization.clone().unwrap_or_else(|| "N/A".to_string());
-            println!(
-                "IP Asli Perangkat: {} | Negara: {} | Organisasi: {}",
-                meta.ip,
-                clean_string(&country),
-                clean_string(&org)
-            );
-            meta // Kembalikan seluruh struct meta, yang sekarang masih utuh
-        }
+async fn main() -> Result<()> {
+    println!("Starting proxy scanner...");
+    
+    // Create output directory if it doesn't exist
+    if let Some(parent) = Path::new(OUTPUT_FILE).parent() {
+        fs::create_dir_all(parent)?;
+    }
+    
+    // Clear output file before starting
+    File::create(OUTPUT_FILE)?;
+    println!("File {} has been cleared before scanning process started.", OUTPUT_FILE);
+    
+    // Read proxy list from file
+    let proxies = match read_proxy_file(PROXY_FILE) {
+        Ok(proxies) => proxies,
         Err(e) => {
-            eprintln!("Gagal mendapatkan IP asli perangkat dari Cloudflare: {}", e);
-            eprintln!("Pastikan Anda memiliki koneksi internet aktif.");
-            return Ok(());
+            eprintln!("Error reading proxy file: {}", e);
+            return Err(e.into());
         }
     };
-    let original_ip = Arc::new(original_meta.ip);
-
-    // 2. Baca daftar proxy dari file (misal: proxies.txt)
-    let file = File::open("data/rawProxyList.txt").await?;
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
-    let mut proxy_list = Vec::new();
-
-    println!("Membaca daftar proxy dari proxies.txt...");
-    while let Some(line) = lines.next_line().await? {
-        let trimmed_line = line.trim();
-        if !trimmed_line.is_empty() {
-            proxy_list.push(trimmed_line.to_string());
+    
+    println!("Loaded {} proxies from file", proxies.len());
+    
+    // Get original IP (without proxy)
+    let original_ip_data = match check_connection(IP_RESOLVER, PATH_RESOLVER, None).await {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to get original IP info: {}", e);
+            return Err(e.into());
         }
-    }
-
-    if proxy_list.is_empty() {
-        println!("Tidak ada proxy ditemukan di proxies.txt. Harap isi file dengan satu proxy per baris.");
-        return Ok(());
-    }
-    println!("Total {} proxy ditemukan.", proxy_list.len());
-
-    // 3. Proses proxy secara paralel menggunakan Rayon dan Tokio (join_all)
-    let alive_proxies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-
-    // Mengumpulkan semua task async ke dalam sebuah Vec
-    let tasks: Vec<_> = proxy_list
-        .into_par_iter() // Rayon untuk paralelisme pada iterasi
-        .map(|proxy_addr| {
-            let original_ip_clone = Arc::clone(&original_ip);
-            let alive_proxies_clone = Arc::clone(&alive_proxies);
-            tokio::spawn(process_proxy(
-                proxy_addr,
-                original_ip_clone,
-                alive_proxies_clone,
-            ))
+    };
+    
+    let original_ip = match original_ip_data.get("clientIp") {
+        Some(Value::String(ip)) => ip.clone(),
+        _ => {
+            eprintln!("Failed to extract original client IP");
+            return Err("Failed to extract original client IP".into());
+        }
+    };
+    
+    println!("Original IP: {}", original_ip);
+    
+    // Store active proxies
+    let active_proxies = Arc::new(Mutex::new(Vec::new()));
+    
+    // Process proxies concurrently
+    let tasks = futures::stream::iter(
+        proxies.into_iter().map(|proxy_line| {
+            let original_ip = original_ip.clone();
+            let active_proxies = Arc::clone(&active_proxies);
+            
+            async move {
+                process_proxy(proxy_line, &original_ip, &active_proxies).await;
+            }
         })
-        .collect();
-
-    // Menunggu semua task async selesai
-    join_all(tasks).await;
-
-    // 4. Simpan proxy yang aktif ke alive.txt
-    let final_alive_proxies = alive_proxies.lock().unwrap();
-    if final_alive_proxies.is_empty() {
-        println!("Tidak ada proxy aktif yang ditemukan.");
-    } else {
-        let mut output_file = File::create("data/alive.txt").await?;
-        for proxy_entry in final_alive_proxies.iter() {
-            tokio::io::AsyncWriteExt::write_all(&mut output_file, proxy_entry.as_bytes()).await?;
-            tokio::io::AsyncWriteExt::write_all(&mut output_file, b"\n").await?;
+    ).buffer_unordered(MAX_CONCURRENT).collect::<Vec<()>>();
+    
+    tasks.await;
+    
+    // Save active proxies to file
+    let active_proxies = active_proxies.lock().unwrap();
+    if !active_proxies.is_empty() {
+        let mut file = File::create(OUTPUT_FILE)?;
+        for proxy in active_proxies.iter() {
+            writeln!(file, "{}", proxy)?;
         }
-        println!("{} proxy aktif telah disimpan ke alive.txt", final_alive_proxies.len());
+        println!("All active proxies saved to {}", OUTPUT_FILE);
+    } else {
+        println!("No active proxies found");
     }
-
-    println!("Pemeriksaan proxy selesai.");
-
+    
+    println!("Proxy checking completed.");
     Ok(())
+}
+
+fn read_proxy_file(file_path: &str) -> io::Result<Vec<String>> {
+    let file = File::open(file_path)?;
+    let reader = BufReader::new(file);
+    let mut proxies = Vec::new();
+    
+    for line in reader.lines() {
+        let line = line?;
+        if !line.trim().is_empty() {
+            proxies.push(line);
+        }
+    }
+    
+    Ok(proxies)
+}
+
+async fn check_connection(
+    host: &str,
+    path: &str,
+    proxy: Option<(&str, u16)>
+) -> Result<Value> {
+    let host = host.to_string();
+    let path = path.to_string();
+    let proxy = proxy.map(|(ip, port)| (ip.to_string(), port));
+    
+    // Use spawn_blocking to run the blocking SSL connection in a separate thread
+    tokio::task::spawn_blocking(move || {
+        check_connection_sync(&host, &path, proxy.as_ref().map(|(ip, port)| (ip.as_str(), *port)))
+    }).await?
+}
+
+fn check_connection_sync(
+    host: &str,
+    path: &str,
+    proxy: Option<(&str, u16)>
+) -> Result<Value> {
+    // Build HTTP request payload
+    let payload = format!(
+        "GET {} HTTP/1.1\r\n\
+         Host: {}\r\n\
+         User-Agent: Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 \
+         (KHTML, like Gecko) Chrome/42.0.2311.135 Safari/537.36 Edge/12.10240\r\n\
+         Connection: close\r\n\r\n",
+        path, host
+    );
+    
+    // Create TCP connection
+    let stream = if let Some((proxy_ip, proxy_port)) = proxy {
+        // Connect to proxy
+        TcpStream::connect_timeout(
+            &format!("{}:{}", proxy_ip, proxy_port).parse()?,
+            Duration::from_secs(TIMEOUT_SECONDS)
+        )?
+    } else {
+        // Connect directly to host (with DNS resolution)
+        let socket_addr = format!("{}:443", host)
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Could not resolve hostname"))?;
+        
+        TcpStream::connect_timeout(
+            &socket_addr,
+            Duration::from_secs(TIMEOUT_SECONDS)
+        )?
+    };
+    
+    stream.set_read_timeout(Some(Duration::from_secs(TIMEOUT_SECONDS)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(TIMEOUT_SECONDS)))?;
+    
+    // Create TLS connection
+    let connector = TlsConnector::new()?;
+    let mut tls_stream = connector.connect(host, stream)?;
+    
+    // Send HTTP request
+    tls_stream.write_all(payload.as_bytes())?;
+    
+    // Read response
+    let mut response = Vec::new();
+    let mut buffer = [0; 4096];
+    
+    loop {
+        match tls_stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buffer[..n]),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    
+    // Parse response
+    let response_str = String::from_utf8_lossy(&response);
+    
+    // Split headers and body
+    if let Some(body_start) = response_str.find("\r\n\r\n") {
+        let body = &response_str[body_start + 4..];
+        
+        // Try to parse the JSON body
+        match serde_json::from_str::<Value>(body.trim()) {
+            Ok(json_data) => Ok(json_data),
+            Err(e) => {
+                // If JSON parsing fails, print the response for debugging
+                eprintln!("Failed to parse JSON: {}", e);
+                eprintln!("Response body: {}", body);
+                Err("Invalid JSON response".into())
+            }
+        }
+    } else {
+        Err("Invalid HTTP response".into())
+    }
+}
+
+fn clean_org_name(org_name: &str) -> String {
+    org_name.chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect()
+}
+
+async fn process_proxy(
+    proxy_line: String,
+    original_ip: &str,
+    active_proxies: &Arc<Mutex<Vec<String>>>
+) {
+    let parts: Vec<&str> = proxy_line.split(',').collect();
+    if parts.len() < 4 {
+        println!("Invalid proxy line format: {}. Make sure it's ip,port,country,org", proxy_line);
+        return;
+    }
+    
+    let ip = parts[0];
+    let port = parts[1];
+    let country = parts[2];
+    let org = parts[3];
+    
+    let port_num = match port.parse::<u16>() {
+        Ok(p) => p,
+        Err(_) => {
+            println!("Invalid port number: {}", port);
+            return;
+        }
+    };
+    
+    match check_connection(IP_RESOLVER, PATH_RESOLVER, Some((ip, port_num))).await {
+        Ok(proxy_data) => {
+            if let Some(Value::String(proxy_ip)) = proxy_data.get("clientIp") {
+                if proxy_ip != original_ip {
+                    let org_name = if let Some(Value::String(org_name)) = proxy_data.get("asOrganization") {
+                        clean_org_name(org_name)
+                    } else {
+                        org.to_string()  // Use the original org if not available in response
+                    };
+                    
+                    let proxy_entry = format!("{},{},{},{}", ip, port, country, org_name);
+                    println!("CF PROXY LIVE!: {}", proxy_entry);
+                    
+                    let mut active_proxies = active_proxies.lock().unwrap();
+                    active_proxies.push(proxy_entry);
+                } else {
+                    println!("CF PROXY DEAD! (Same IP): {}:{}", ip, port);
+                }
+            } else {
+                println!("CF PROXY DEAD! (No client IP): {}:{}", ip, port);
+            }
+        },
+        Err(e) => {
+            println!("CF PROXY DEAD! (Error): {}:{} - {}", ip, port, e);
+        }
+    }
 }
